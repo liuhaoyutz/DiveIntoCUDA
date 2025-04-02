@@ -121,7 +121,7 @@ __global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
         // calculate the mean
         float m = 0.0f;
         for (int i = 0; i < C; i++) {
-            m += x[i];
+            m += x[i];  // 每次取x[i]都要访问global memory，共访问C次，所以效率低
         }
         m = m / C;
 
@@ -143,7 +143,7 @@ __global__ void layernorm_forward_kernel1(float* out, float* mean, float* rstd,
         for (int i = 0; i < C; i++) {
             float n = (s * (x[i] - m)); // normalized output  对当前time step的每一个特征值进行归一化
             float o = n * weight[i] + bias[i]; // scale and shift it  每个特征值使用weight进行缩放，通过bias进行偏移
-            out_idx[i] = o; // write  写入output
+            out_idx[i] = o; // write  写入output，每次写入都要访问global memory，共访问C次，所以效率低
         }
         // cache the mean and rstd for the backward pass later
         mean[idx] = m;
@@ -167,7 +167,7 @@ __global__ void mean_kernel(float* mean, const float* inp, int N, int C, int blo
     int tid = threadIdx.x; // range [0, block_size)
     const float* x = inp + idx * C;  // x代表当前time step，包括768维特征值
 
-    // 线程粗化（Thread Coarsening），每个线程负责累加一部分元素（从 tid 开始，每次跳跃 block_size 个元素），
+    // 线程粗化（Thread Coarsening），每个线程负责累加一部分元素（从 tid 开始，每次跳跃 block_size 个元素），即每个线程负责C / block_size个元素，
     // 这样可以利用更多的线程来分担工作，提高并行度。
     // thread coarsening
     float sum = 0.0f;
@@ -273,20 +273,20 @@ __global__ void layernorm_forward_kernel3(float* __restrict__ out, float* __rest
     }
 
     // the row of input that this group of threads is responsible for
-    const float* x = inp + idx * C;
+    const float* x = inp + idx * C;  // x代表当前要处理的time step，包括768个特征值
 
     // mean
     float sum = 0.0f;
     for (int i = warp.thread_rank(); i < C; i += warp.size()) {
         sum += x[i];
     }
-
     // 使用 cg::reduce 对瓦片内的线程进行归约操作，计算总和。注意这个cg::reduce函数的调用，这个就是协作组高效的地方。
     // 调用cg:reduce函数就完成了之前v2版本mean_kernel中for循环的工作，并且cg:reduce是硬件加速的，更加高效。
     sum = cg::reduce(warp, sum, cg::plus<float>{});
-    float m = sum / C;
+    float m = sum / C;  // 求均值
+    // 由瓦片中的第一个线程写入mean数组（如果提供了mean数组）。
     if(warp.thread_rank() == 0 && mean != nullptr) {
-        __stcs(mean + idx, m);
+        __stcs(mean + idx, m);  // __stcs函数的作用是将数据写入全局内存，并指定特殊的缓存行为。
     }
 
     // rstd

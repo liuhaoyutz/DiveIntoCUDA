@@ -27,6 +27,27 @@ version 7 is softmax optimized for very large C.
 ./softmax_forward 7
 */
 
+/*
+Softmax 是一种基本的归一化函数，它可以将一个数值向量归一化为一个概率分布向量，且各个概率之和为1。Softmax 可以用来作为神经网络的最后一层，用于多分类问题的输出。
+
+Softmax溢出问题是指在计算Softmax函数时，由于输入值过大导致指数运算结果超出计算机浮点数表示范围的问题。为了避免溢出，通常要先减最大值。
+
+Softmax是self-attention里计算score的关键环节，而最关键的实际上是两个reduce操作，即max和sum。
+
+v1: 每个线程负责以for循环的方式，从全局内存读取并求C个数据的maxval和sum。
+
+v2: 每个线程负责以for循环的方式，从全局内存读取并求C / block_size个数据的maxval，中间结果放入共享内存，然后对共享内存中的中间结果归约得到block范围内的maxval。然后求C / block_size个数据的sumval，中间结果放入共享内存，然后对共享内存中的中间结果归约得到block范围内的sumval。最后计算softmax结果。
+
+关于warp内操作函数及协作组，参考https://github.com/brucefan1983/CUDA-Programming中第11章，线程束基本函数与协作组
+
+v3: 每个线程负责以for循环的方式，从全局内存读取并求C / blockDim.x（50257 / 32）个数据的maxval，然后用__shfl_down_sync 内建函数进行warp内的数据操作，进而取得warp内的maxval。然后求C / blockDim.x个数据的expf和sumval。然后用__shfl_down_sync 内建函数进行warp内的数据共享，进而取得warp内的sumval。最后计算softmax结果。
+也就是说一个block固定为32个线程，即一个block对应一个warp。一个block处理50257个数据，所以每个线程处理50257 / 32个数据，每个线程取得这些数据的最大值（或和），然后调用__shfl_down_sync在warp内提取这32个线程的最大值（或和），最后计算softmax结果。
+
+v2归约使用的共享内存，而v3使用更高效的__shfl_down_sync 内建函数进行warp内的数据共享。
+
+总的来说，优化的思想是一共C个数据，有n个线程，每个线程负责C / n个数据，得到中间结果，然后再通过协作组或intra-warp reductions或共享内存方式进一步reduce n个线程的中间结果，得到最终数据。
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -37,31 +58,33 @@ version 7 is softmax optimized for very large C.
 
 // ----------------------------------------------------------------------------
 // CPU code reference
-
 void softmax_forward_cpu(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
     // out is (N, C), each row of inp will get softmaxed
-    for (int i = 0; i < N; i++) {
-        const float* inp_row = inp + i * C;
-        float* out_row = out + i * C;
+    // N=B*T，即N代表time step个数。
+    // C代表每个time step有C个特征值，C为50257，即每个time step有50257个特征值
+    for (int i = 0; i < N; i++) {  // 外层循环每次处理一个time step
+        const float* inp_row = inp + i * C;  // inp_row对应一个time step
+        float* out_row = out + i * C;  // out_row也对应一个time step
 
         float maxval = -INFINITY;
-        for (int j = 0; j < C; j++) {
+        for (int j = 0; j < C; j++) {  // 遍历当前time step的所有特征值，找到其中的最大值，赋值给maxval
             if (inp_row[j] > maxval) {
                 maxval = inp_row[j];
             }
         }
+
         // Note: since we want to ensure that the CUDA-kernels are accurate,
         // we do this accumulation in higher precision, so we can be assured
         // that our ground-truth is of high quality.
         double sum = 0.0;
-        for (int j = 0; j < C; j++) {
-            out_row[j] = expf(inp_row[j] - maxval);
-            sum += out_row[j];
+        for (int j = 0; j < C; j++) {  // 遍历当前time step
+            out_row[j] = expf(inp_row[j] - maxval);  // 每个特征值 - 最大特征值，然后做指数运算
+            sum += out_row[j];  // 对所有特征值的指数运算结果求和
         }
-        float norm = 1.f / (float)sum;
-        for (int j = 0; j < C; j++) {
-            out_row[j] *= norm;
+        float norm = 1.f / (float)sum;  // 将所有特征值的指数运算结果之和的倒数，赋值给norm
+        for (int j = 0; j < C; j++) {  // 遍历当前time step
+            out_row[j] *= norm;  // 求每个特征值的softmax值
         }
     }
 }
@@ -71,13 +94,15 @@ void softmax_forward_cpu(float* out, const float* inp, int N, int C) {
 void softmax_forward_online_cpu(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
     // out is (N, C), each row of inp will get softmaxed
-    for (int i = 0; i < N; i++) {
-        const float* inp_row = inp + i * C;
-        float* out_row = out + i * C;
+    // N=B*T，即N代表time step个数。
+    // C代表每个time step有C个特征值，C为50257，即每个time step有50257个特征值
+    for (int i = 0; i < N; i++) {  // 外层循环每次处理一个time step
+        const float* inp_row = inp + i * C;  // inp_row对应一个time step
+        float* out_row = out + i * C;  // out_row也对应一个time step
 
         float maxval = -INFINITY;
         float sum = 0.0f;
-		for (int j = 0; j < C; j++) {
+		for (int j = 0; j < C; j++) {  // 遍历当前time step的所有特征值，找到其中的最大值，赋值给maxval，并分情况计算sum
 			float maxval_prev = maxval;
 			if (inp_row[j] > maxval) {
 				maxval = inp_row[j];
@@ -88,7 +113,7 @@ void softmax_forward_online_cpu(float* out, const float* inp, int N, int C) {
 		}
 
         for (int j = 0; j < C; j++) {
-            out_row[j] = expf(inp_row[j] - maxval) / sum;
+            out_row[j] = expf(inp_row[j] - maxval) / sum;  // 求每个特征值的softmax值
         }
     }
 }
@@ -99,24 +124,26 @@ void softmax_forward_online_cpu(float* out, const float* inp, int N, int C) {
 __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
     // out is (N, C), each row of inp will get softmaxed
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
+    // N = B * T，即N为time step个数
+    int i = blockIdx.x * blockDim.x + threadIdx.x;  // i是每个线程对应的index
+    if (i < N) {  // 每个线程对应一个time step，处理该time step对应的C个特征值
         const float* inp_row = inp + i * C;
         float* out_row = out + i * C;
 
         float maxval = -INFINITY;
-        for (int j = 0; j < C; j++) {
-            if (inp_row[j] > maxval) {
+        for (int j = 0; j < C; j++) {  // 遍历当前时间步对应的所有特征值，找出最大特征值
+            if (inp_row[j] > maxval) {  // 每一次访问inp_row[j]都需要访问global memory，共循环C次，所以效率低
                 maxval = inp_row[j];
             }
         }
         double sum = 0.0;
         for (int j = 0; j < C; j++) {
-            out_row[j] = expf(inp_row[j] - maxval);
+            out_row[j] = expf(inp_row[j] - maxval);  // 每一次访问out_row[j]都要访问global memory，共循环C次，所以效率低
             sum += out_row[j];
         }
+
         for (int j = 0; j < C; j++) {
-            out_row[j] /= (float)sum;
+            out_row[j] /= (float)sum;  // 计算每个特征值对应的softmax值，每次保存out_row[j]值都要访问global memory
         }
     }
 }
@@ -124,18 +151,26 @@ __global__ void softmax_forward_kernel1(float* out, const float* inp, int N, int
 __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
     // in each row of C elements, first calculates maxval, then returns expf(val - maxval)
+
+    // 要使用动态定义的共享内存，第一，必须加上extern限定词；第二，不能指定数组大小。
     extern __shared__ float shared[];
+
     int idx = blockIdx.x; // ranges [0, N)
     int tid = threadIdx.x; // ranges [0, block_size)
     int block_size = blockDim.x;
     const float* x = inp + idx * C; // idx-th row of inp, inp[idx,:]
+    
+    // 线程粗化（Thread Coarsening），每个线程负责累加一部分元素（从 tid 开始，每次跳跃 block_size 个元素），即每个线程负责C / block_size个元素，
+    // 这样可以利用更多的线程来分担工作，提高并行度。
     // thread coarsening
     float maxval = -INFINITY;
     for (int i = tid; i < C; i += block_size) {
         maxval = fmaxf(maxval, x[i]);
     }
-    shared[tid] = maxval;
+    shared[tid] = maxval;  // 将当前线程负责的maxval写入共享内存
     __syncthreads();
+    
+    // 通过共享内存对中间maxval进行归约，求得全部特征值的最大值
     // reductions
     for (int stride = block_size / 2; stride >= 1; stride /= 2) {
         __syncthreads();
@@ -145,19 +180,24 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
     }
     __syncthreads();
     float offset = shared[0];
+
     // compute expf and write the result to global memory
     for (int i = tid; i < C; i += block_size) {
         out[idx * C + i] = expf(x[i] - offset);
     }
     __syncthreads();
+
+    // 线程粗化，每个线程负责C / block_size个特征值。计算每个线程负责的特征值的sum。
     // thread coarsening again, for the sum
     x = out + idx * C; // idx-th row of out
     float sumval = 0.0f;
     for (int i = tid; i < C; i += block_size) {
         sumval += x[i];
     }
-    shared[tid] = sumval;
+    shared[tid] = sumval;  // 将当前线程负责的C / block_size个特征值的sumval保存在共享内存中
     __syncthreads();
+
+    // 在共享内存中对每个线程的sum进行归约（累加），得到所有特征值的sum。
     // reductions
     for (int stride = block_size / 2; stride >= 1; stride /= 2) {
         __syncthreads();
@@ -168,12 +208,54 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
     // broadcast the sum to all threads in the block
     __syncthreads();
     float sum = shared[0];
+
     // divide the input values by the sum
     for (int i = tid; i < C; i += block_size) {
-        out[idx * C + i] = x[i] / sum;
+        out[idx * C + i] = x[i] / sum;  // 计算每个特征值的softmax值
     }
 }
 
+// 用 __device__ 修饰的函数称为设备函数，只能被核函数或其他设备函数调用，在设备中执行。
+
+/*
+__shfl_down_sync(mask, v, d, w)：标号为 t 的参与线程返回标号为 t + d 的线程
+中变量 v 的值。标号满足 t + d >= w 的线程返回原来的 v。例如：当 w = 8，d = 2 时，
+该函数将第 2-7 号线程中变量 v 的值传送到第 0-5 号线程，而第 6-7 号线程返回它们
+原来的 v。形象地说，这是一种将数据向下平移的操作。
+*/
+
+/*
+假设当前线程的线程号为tid，则__shfl_down_sync(0xFFFFFFFF, val, offset)的作用是返回线程号为tid+offset的线程的val值。
+第一轮循环：offset为16。
+对于第0号线程，__shfl_down_sync返回的是0+16号线程的val值，所以，fmaxf是比较0号线程和16号线程的val值，并将较大的那个保存在0号线程的的val变量中。
+对于第1号线程，__shfl_down_sync返回的是1+16号线程的val值，所以，fmaxf是比较1号线程和17号线程的val值，并将较大的那个保存在1号线程的的val变量中。
+... ...
+对于第15号线程，__shfl_down_sync返回的是15+16号线程的val值，所以，fmaxf是比较15号线程和31号线程的val值，并将较大的那个保存在15号线程的的val变量中。
+对于第16到31号线程，tid+offset > warp_size了，__shfl_down_sync返回自己的val，相当于不变。形象的说，__shfl_down_sync是一种数据向下平移的操作。
+
+
+第二轮循环，offset为8。
+对于第0号线程，__shfl_down_sync返回的是0+8号线程的val值，所以，fmaxf是比较0号线程和8号线程的val值，并将较大的那个保存在0号线程的的val变量中。
+... ...
+对于第7号线程，__shfl_down_sync返回的是7+8号线程的val值，所以，fmaxf是比较7号线程和15号线程的val值，并将较大的那个保存在7号线程的的val变量中。
+
+第三轮循环，offset为4。
+对于第0号线程，__shfl_down_sync返回的是0+4号线程的val值，所以，fmaxf是比较0号线程和4号线程的val值，并将较大的那个保存在0号线程的的val变量中。
+... ...
+对于第3号线程，__shfl_down_sync返回的是3+4号线程的val值，所以，fmaxf是比较3号线程和7号线程的val值，并将较大的那个保存在3号线程的的val变量中。
+
+第四轮循环，offset为2。
+对于第0号线程，__shfl_down_sync返回的是0+2号线程的val值，所以，fmaxf是比较0号线程和2号线程的val值，并将较大的那个保存在0号线程的的val变量中。
+... ...
+对于第1号线程，__shfl_down_sync返回的是1+2号线程的val值，所以，fmaxf是比较1号线程和3号线程的val值，并将较大的那个保存在1号线程的的val变量中。
+
+第五轮循环，offset为1。
+对于第0号线程，__shfl_down_sync返回的是0+1号线程的val值，所以，fmaxf是比较0号线程和1号线程的val值，并将较大的那个保存在0号线程的的val变量中。
+
+循环结束。这样，0号线程的val就是整个warp的最大val。
+*/
+
+// 该函数查找并返回线程束范围内的最大值
 // warp-level reduction for finding the maximum value
 __device__ float warpReduceMax(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -182,6 +264,8 @@ __device__ float warpReduceMax(float val) {
     return val;
 }
 
+// 用 __device__ 修饰的函数称为设备函数，只能被核函数或其他设备函数调用，在设备中执行。
+// 该函数返回线程束范围内所有val之和
 // warp-level reduction for summing values
 __device__ float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -192,40 +276,47 @@ __device__ float warpReduceSum(float val) {
 
 __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int C) {
     // kernel must use block size of 32
-    extern __shared__ float shared[];
+    // 要使用动态定义的共享内存，第一，必须加上extern限定词；第二，不能指定数组大小。
+    extern __shared__ float shared[];  // 这个共享内存没有使用
+
     int idx = blockIdx.x;
     int tid = threadIdx.x;
-    const float* x = inp + idx * C;
+    const float* x = inp + idx * C;  // x代表当前time step
 
+    // 线程粗化，计算局部max
     // Thread coarsening and within-warp reduction for maxval
     float maxval = -INFINITY;
     for (int i = tid; i < C; i += blockDim.x) {
         maxval = fmaxf(maxval, x[i]);
     }
-    maxval = warpReduceMax(maxval);
+    maxval = warpReduceMax(maxval);  // 调用设备函数warpReduceMax取得warp内最大值
 
+    // 这个__shfl_sync调用在warp内每个线程中，都返回0号线程的maxval。所以这一行的使用是把0号线程的maxval广播到每个线程，并保存为offset。
     // Broadcast maxval within the warp
     float offset = __shfl_sync(0xFFFFFFFF, maxval, 0);
 
+    // 计算expf
     // Compute expf and write the result to global memory
     for (int i = tid; i < C; i += blockDim.x) {
         out[idx * C + i] = expf(x[i] - offset);
     }
 
+    // 线程粗化，计算局部sum
     // Thread coarsening and within-warp reduction for sumval
     x = out + idx * C;
     float sumval = 0.0f;
     for (int i = tid; i < C; i += blockDim.x) {
         sumval += x[i];
     }
-    sumval = warpReduceSum(sumval);
+    sumval = warpReduceSum(sumval);  // 调用设备函数warpReduceSum取得warp内sum
 
+    // 在warp内广播sumval
     // Broadcast sumval within the warp
     float sum = __shfl_sync(0xFFFFFFFF, sumval, 0);
 
     // Divide the input values by the sum
     for (int i = tid; i < C; i += blockDim.x) {
-        out[idx * C + i] = x[i] / sum;
+        out[idx * C + i] = x[i] / sum;  // 计算每个特征值的softmax值
     }
 }
 
@@ -595,9 +686,9 @@ void softmax_forward(int kernel_num, float* out, const float* inp, int N, int C,
 int main(int argc, char **argv) {
     srand(0);
 
-    int B = 8;
-    int T = 1024;
-    int V = 50257;
+    int B = 8;  // 每个batch包含8个样本
+    int T = 1024;  // 每个样本包含1024个time step
+    int V = 50257;  // 每个time step包含50257个特征值
 
     int deviceIdx = 0;
     cudaCheck(cudaSetDevice(deviceIdx));
@@ -621,7 +712,7 @@ int main(int argc, char **argv) {
     float* d_inp;
     cudaCheck(cudaMalloc(&d_out, B * T * V * sizeof(float)));
     cudaCheck(cudaMalloc(&d_inp, B * T * V * sizeof(float)));
-    cudaCheck(cudaMemcpy(d_inp, inp, B * T * V * sizeof(float), cudaMemcpyHostToDevice));
+    cudaCheck(cudaMemcpy(d_inp, inp, B * T * V * sizeof(float), cudaMemcpyHostToDevice));  // 将CPU上的inp拷贝到GPU上的d_inp
 
     // read kernel_num from command line
     int kernel_num = 1;
@@ -632,6 +723,7 @@ int main(int argc, char **argv) {
 
     int block_sizes[] = {32, 64, 128, 256, 512, 1024};
 
+    // softmax forward的CPU实现
     softmax_forward_cpu(out, inp, B * T, V);
     {
         float max_el = -INFINITY;
@@ -646,12 +738,13 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        softmax_forward(kernel_num, d_out, d_inp, B * T, V, block_size);
-        validate_result(d_out, out, "out", B * T * V, 1e-4f);
+        softmax_forward(kernel_num, d_out, d_inp, B * T, V, block_size);  // softmax forward的GPU实现
+        validate_result(d_out, out, "out", B * T * V, 1e-4f);  // 比较CPU实现和GPU实现结果是否相同
     }
 
     printf("All results match. Starting benchmarks.\n\n");
 
+    // 对softmax的GPU实现进行性能评估
     // time the kernel at different block sizes
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
